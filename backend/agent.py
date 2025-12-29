@@ -1,386 +1,391 @@
 """
 ShariahFolio LangGraph Agent Module
-A conversational agent that gathers user constraints and triggers portfolio optimization.
+A tool-based conversational agent that uses LangChain tools for portfolio optimization.
+
+This agent uses a ReAct pattern where the LLM decides when to call tools
+to get real data, ensuring no hallucinated portfolio results.
 """
 
-import json
-import re
-from typing import TypedDict, Annotated, List, Optional, Literal
+import logging
+from typing import TypedDict, Annotated, List, Optional, Sequence
 from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
+from langchain_core.messages import (
+    HumanMessage,
+    AIMessage,
+    SystemMessage,
+    BaseMessage,
+    ToolMessage
+)
 
 from .config import (
-    OPENROUTER_API_KEY, OPENROUTER_BASE_URL, OPENROUTER_MODEL,
-    EGX33_TICKERS, RISK_PROFILES, TICKER_NAMES
+    OPENROUTER_API_KEY,
+    OPENROUTER_BASE_URL,
+    OPENROUTER_MODEL,
 )
-from .portfolio_model import get_optimizer
-from .data_loader import get_data_loader
+from .tools import get_portfolio_tools
+from .utils.prompt_loader import load_prompt
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# Constants
+MAX_MESSAGE_HISTORY = 30  # Maximum messages to keep in history
 
 
-# Agent State
+# =============================================================================
+# AGENT STATE
+# =============================================================================
+
 class AgentState(TypedDict):
     """State for the portfolio agent."""
     messages: Annotated[List[BaseMessage], "Conversation history"]
-    investment_amount: Optional[float]
-    preferred_stocks: List[str]
-    risk_profile: Optional[str]
-    allocation: Optional[dict]
-    error: Optional[str]
-    current_node: str
-    needs_info: bool
+    pending_tool_calls: Optional[List[dict]]
+    tool_call_count: int  # Counter to prevent infinite tool calling loops
+
+
+# Maximum number of tool calls allowed per user message
+MAX_TOOL_CALLS_PER_REQUEST = 3
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def trim_message_history(
+    messages: List[BaseMessage],
+    max_messages: int = MAX_MESSAGE_HISTORY
+) -> List[BaseMessage]:
+    """
+    Trim message history to prevent token overflow.
+    Keeps the most recent messages.
+    """
+    if len(messages) <= max_messages:
+        return messages
+    return messages[-max_messages:]
+
+
+def get_system_prompt() -> str:
+    """Get the system prompt for the agent."""
+    try:
+        return load_prompt("consultant_system")
+    except FileNotFoundError:
+        logger.warning("System prompt file not found, using fallback")
+        return _get_fallback_system_prompt()
+
+
+def _get_fallback_system_prompt() -> str:
+    """Fallback system prompt if file loading fails."""
+    return """You are ShariahFolio, an AI investment advisor for Shariah-compliant Egyptian stocks (EGX 33 Index).
+
+IMPORTANT RULES:
+1. ALWAYS use the `optimize_portfolio` tool to generate portfolios - NEVER make up numbers
+2. ALWAYS use `get_stock_info` for stock details
+3. Gather investment amount and either specific tickers or risk profile before optimizing
+
+Available tools:
+- optimize_portfolio: Create optimized portfolio (needs: investment_amount, and either tickers or risk_profile)
+- get_stock_info: Get stock details (needs: ticker)
+- list_available_stocks: Show all available stocks
+- get_stocks_by_risk_profile: Preview stocks for a risk level
+
+Be helpful, concise, and professional."""
 
 
 def create_llm():
-    """Create the LLM client for OpenRouter."""
-    return ChatOpenAI(
+    """Create the LLM client with tools bound."""
+    if not OPENROUTER_API_KEY:
+        logger.warning("OPENROUTER_API_KEY not set. LLM calls will fail.")
+
+    tools = get_portfolio_tools()
+
+    llm = ChatOpenAI(
         model=OPENROUTER_MODEL,
         openai_api_key=OPENROUTER_API_KEY,
         openai_api_base=OPENROUTER_BASE_URL,
         temperature=0.7,
-        max_tokens=1024
+        max_tokens=2048
     )
 
-
-# System prompt for the consultant
-CONSULTANT_SYSTEM_PROMPT = """You are ShariahFolio, an expert Islamic finance advisor specializing in the Egyptian Exchange (EGX) Shariah-compliant stocks. You help users build optimized investment portfolios based on their preferences.
-
-Your capabilities:
-1. Help users invest in the EGX 33 Shariah Index stocks
-2. Consider their budget, preferred stocks, and risk tolerance
-3. Use AI-powered portfolio optimization
-
-Available EGX 33 Shariah stocks:
-ADIB.CA, SAUD.CA, AMOC.CA, ACGC.CA, ARCC.CA, CLHO.CA, SUGR.CA, EFID.CA, EFIH.CA, EGAL.CA, EGTS.CA, ETRS.CA, EMFD.CA, FAIT.CA, FAITA.CA, ISPH.CA, ICFC.CA, JUFO.CA, LCSW.CA, MASR.CA, MCQE.CA, ATQA.CA, MTIE.CA, EGAS.CA, OLFI.CA, ORAS.CA, ORHD.CA, ORWE.CA, PHDC.CA, SKPC.CA, OCDI.CA, TMGH.CA, ETEL.CA, RMDA.CA
-
-When gathering information:
-1. Ask for investment amount (in EGP or USD)
-2. Ask if they have preferred stocks OR a risk profile (conservative/moderate/aggressive)
-3. Be friendly, professional, and concise
-
-When you have enough information, respond with a JSON block in this exact format:
-```json
-{
-    "ready": true,
-    "investment_amount": <number>,
-    "preferred_stocks": ["TICKER1.CA", "TICKER2.CA"],
-    "risk_profile": "conservative" | "moderate" | "aggressive" | null
-}
-```
-
-If you don't have enough info, just chat normally to gather it."""
+    # Bind tools to the LLM
+    return llm.bind_tools(tools)
 
 
-def consultant_node(state: AgentState) -> AgentState:
+# =============================================================================
+# GRAPH NODES
+# =============================================================================
+
+def agent_node(state: AgentState) -> AgentState:
     """
-    Chat with user and extract investment parameters.
-    Uses LLM to understand user intent and extract entities.
+    The main agent node that processes messages and decides on actions.
+    Uses the LLM to either respond directly or call tools.
     """
-    llm = create_llm()
-    
-    # Build messages for LLM
-    messages = [SystemMessage(content=CONSULTANT_SYSTEM_PROMPT)]
-    messages.extend(state["messages"])
-    
-    # Get LLM response
-    response = llm.invoke(messages)
-    response_text = response.content
-    
-    # Try to extract JSON from response
-    json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
-    
-    new_state = state.copy()
-    new_state["current_node"] = "consultant"
-    
-    if json_match:
-        try:
-            extracted = json.loads(json_match.group(1))
-            
-            if extracted.get("ready"):
-                new_state["investment_amount"] = extracted.get("investment_amount")
-                new_state["preferred_stocks"] = extracted.get("preferred_stocks", [])
-                new_state["risk_profile"] = extracted.get("risk_profile")
-                new_state["needs_info"] = False
-                
-                # Remove JSON from visible response
-                clean_response = response_text.replace(json_match.group(0), "").strip()
-                if not clean_response:
-                    clean_response = "Great! I have all the information I need. Let me optimize your portfolio..."
-                    
-                new_state["messages"] = state["messages"] + [AIMessage(content=clean_response)]
-            else:
-                new_state["needs_info"] = True
-                new_state["messages"] = state["messages"] + [AIMessage(content=response_text)]
-                
-        except json.JSONDecodeError:
-            new_state["needs_info"] = True
-            new_state["messages"] = state["messages"] + [AIMessage(content=response_text)]
-    else:
-        new_state["needs_info"] = True
-        new_state["messages"] = state["messages"] + [AIMessage(content=response_text)]
-    
-    return new_state
+    tool_call_count = state.get("tool_call_count", 0)
+    logger.info(f"Agent node - Processing messages (tool_call_count: {tool_call_count})")
 
+    # Check if we've exceeded the tool call limit
+    if tool_call_count >= MAX_TOOL_CALLS_PER_REQUEST:
+        logger.warning(f"Tool call limit ({MAX_TOOL_CALLS_PER_REQUEST}) reached, forcing response")
 
-def validator_node(state: AgentState) -> AgentState:
-    """
-    Validate the extracted information.
-    Check if tickers are valid EGX 33 stocks.
-    """
-    new_state = state.copy()
-    new_state["current_node"] = "validator"
-    
-    data_loader = get_data_loader()
-    valid_tickers = data_loader.get_valid_tickers()
-    
-    # Validate investment amount
-    if not state["investment_amount"] or state["investment_amount"] <= 0:
-        new_state["error"] = "Please provide a valid investment amount greater than 0."
-        new_state["needs_info"] = True
-        return new_state
-    
-    # Validate tickers if provided
-    if state["preferred_stocks"]:
-        invalid_tickers = [t for t in state["preferred_stocks"] if t not in valid_tickers]
-        
-        if invalid_tickers:
-            new_state["error"] = f"Invalid tickers: {', '.join(invalid_tickers)}. Please choose from the EGX 33 Shariah stocks."
-            new_state["needs_info"] = True
-            return new_state
-    
-    # Validate risk profile if no stocks specified
-    if not state["preferred_stocks"] and not state["risk_profile"]:
-        new_state["error"] = "Please specify either preferred stocks or a risk profile (conservative, moderate, or aggressive)."
-        new_state["needs_info"] = True
-        return new_state
-    
-    new_state["error"] = None
-    new_state["needs_info"] = False
-    
-    return new_state
+        # Check if the last tool result was an error
+        last_tool_result = None
+        for msg in reversed(state["messages"]):
+            if isinstance(msg, ToolMessage):
+                last_tool_result = msg.content
+                break
 
-
-def optimizer_node(state: AgentState) -> AgentState:
-    """
-    Run portfolio optimization using the LSTM model and Mean-Variance Optimization.
-    """
-    new_state = state.copy()
-    new_state["current_node"] = "optimizer"
-    
-    optimizer = get_optimizer()
-    
-    # Get stocks to optimize
-    if state["preferred_stocks"]:
-        tickers = state["preferred_stocks"]
-    elif state["risk_profile"]:
-        tickers = optimizer.get_stocks_by_risk_profile(state["risk_profile"])
-    else:
-        # Default to top 5 by recent performance
-        tickers = optimizer.data_loader.get_valid_tickers()[:5]
-    
-    # Run optimization
-    try:
-        result = optimizer.optimize_portfolio(
-            tickers=tickers,
-            investment_amount=state["investment_amount"]
-        )
-        
-        if "error" in result:
-            new_state["error"] = result["error"]
+        # Generate appropriate forced response based on tool results
+        if last_tool_result and "Error" in last_tool_result:
+            forced_content = f"I encountered an issue while processing your request. {last_tool_result}\n\nCould you please try rephrasing your request or provide different parameters?"
+        elif last_tool_result and "## Portfolio" in last_tool_result:
+            # Tool succeeded, present the results
+            forced_content = f"Here are your portfolio optimization results:\n\n{last_tool_result}"
         else:
-            new_state["allocation"] = result
-            
+            forced_content = "I've gathered the portfolio information. Based on my analysis, please see the results above. Let me know if you'd like any adjustments or have questions about the allocation!"
+
+        forced_response = AIMessage(content=forced_content)
+        return {
+            "messages": list(state["messages"]) + [forced_response],
+            "pending_tool_calls": None,
+            "tool_call_count": tool_call_count
+        }
+
+    llm = create_llm()
+
+    # Build messages with system prompt
+    system_prompt = get_system_prompt()
+    messages = [SystemMessage(content=system_prompt)]
+
+    # Add conversation history (trimmed)
+    trimmed_history = trim_message_history(state["messages"])
+    messages.extend(trimmed_history)
+
+    # Invoke LLM
+    try:
+        response = llm.invoke(messages)
+        logger.info(f"LLM response type: {type(response).__name__}, has tool_calls: {bool(response.tool_calls)}")
     except Exception as e:
-        new_state["error"] = f"Optimization failed: {str(e)}"
-    
-    return new_state
+        logger.exception(f"LLM invocation failed: {e}")
+        error_message = AIMessage(
+            content="I'm having trouble connecting to my AI service. Please try again in a moment."
+        )
+        return {
+            "messages": list(state["messages"]) + [error_message],
+            "pending_tool_calls": None,
+            "tool_call_count": tool_call_count
+        }
 
+    # Add response to messages
+    new_messages = list(state["messages"]) + [response]
 
-def summary_node(state: AgentState) -> AgentState:
-    """
-    Format the optimization results into a natural language response.
-    """
-    new_state = state.copy()
-    new_state["current_node"] = "summary"
-    
-    if state["error"]:
-        error_msg = f"I encountered an issue: {state['error']}\n\nPlease try again with different parameters."
-        new_state["messages"] = state["messages"] + [AIMessage(content=error_msg)]
-        return new_state
-    
-    if not state["allocation"]:
-        new_state["messages"] = state["messages"] + [AIMessage(content="I couldn't generate an allocation. Please try again.")]
-        return new_state
-    
-    alloc = state["allocation"]
-    
-    # Build summary message
-    summary_parts = [
-        "## Your Optimized Shariah Portfolio\n",
-        f"**Investment Amount:** {alloc['investment_amount']:,.2f} EGP\n",
-        "\n### Portfolio Allocation\n",
-        "| Ticker | Company | Weight | Amount (EGP) |",
-        "|--------|---------|--------|--------------|"
-    ]
-    
-    for ticker, amount in sorted(alloc["allocation"].items(), key=lambda x: x[1], reverse=True):
-        weight = alloc["weights"][ticker]
-        company_name = TICKER_NAMES.get(ticker, ticker)
-        summary_parts.append(f"| {ticker} | {company_name} | {weight*100:.1f}% | {amount:,.2f} |")
-    
-    # Calculate risk-adjusted interpretation
-    expected_return = alloc['expected_return'] * 100
-    volatility = alloc['expected_volatility'] * 100
-    sharpe = alloc['sharpe_ratio']
-    
-    # Risk level interpretation
-    if volatility < 15:
-        risk_level = "Low"
-        risk_desc = "relatively stable with smaller price swings"
-    elif volatility < 25:
-        risk_level = "Moderate"
-        risk_desc = "balanced between stability and growth potential"
+    # Check if there are tool calls
+    if response.tool_calls:
+        logger.info(f"Tool calls requested: {[tc['name'] for tc in response.tool_calls]}")
+        for tc in response.tool_calls:
+            logger.info(f"  Tool: {tc['name']}")
+            logger.info(f"  Args: {tc.get('args', {})}")
+        return {
+            "messages": new_messages,
+            "pending_tool_calls": response.tool_calls,
+            "tool_call_count": tool_call_count  # Will be incremented in tool_executor_node
+        }
     else:
-        risk_level = "High"
-        risk_desc = "more volatile but with higher growth potential"
-    
-    # Sharpe interpretation
-    if sharpe < 0.5:
-        sharpe_desc = "The risk-adjusted return is below average. Consider a more conservative allocation."
-    elif sharpe < 1.0:
-        sharpe_desc = "The portfolio offers reasonable risk-adjusted returns."
-    else:
-        sharpe_desc = "Excellent risk-adjusted returns - the portfolio is well-optimized."
-    
-    summary_parts.extend([
-        "\n### Portfolio Metrics & What They Mean\n",
-        f"**Expected Return: {expected_return:.2f}%**",
-        f"> This is the predicted annual return based on our AI model's analysis of historical patterns. "
-        f"If this holds, a {alloc['investment_amount']:,.0f} EGP investment could grow to approximately "
-        f"{alloc['investment_amount'] * (1 + alloc['expected_return']):,.0f} EGP over one year.\n",
-        f"**Expected Volatility: {volatility:.2f}% ({risk_level} Risk)**",
-        f"> Volatility measures how much the portfolio value may fluctuate. "
-        f"This portfolio is {risk_desc}. Expect daily swings of roughly {volatility/16:.1f}% on average.\n",
-        f"**Sharpe Ratio: {sharpe:.2f}**",
-        f"> The Sharpe Ratio measures return per unit of risk. Higher is better (above 1.0 is excellent). "
-        f"{sharpe_desc}\n",
-        "---",
-        "*This portfolio is optimized using AI-powered predictions and Mean-Variance Optimization, focusing on Shariah-compliant EGX stocks. Past performance does not guarantee future results.*",
-        "\nWould you like me to adjust anything or create a different portfolio?"
-    ])
-    
-    summary_message = "\n".join(summary_parts)
-    new_state["messages"] = state["messages"] + [AIMessage(content=summary_message)]
-    
-    return new_state
+        logger.info("No tool calls, returning response directly")
+        return {
+            "messages": new_messages,
+            "pending_tool_calls": None,
+            "tool_call_count": tool_call_count
+        }
 
 
-def route_after_consultant(state: AgentState) -> Literal["validator", "end"]:
-    """Decide where to go after consultant node."""
-    if state.get("needs_info", True):
-        return "end"  # Wait for more user input
-    return "validator"
+def tool_executor_node(state: AgentState) -> AgentState:
+    """
+    Execute tool calls and return results.
+    """
+    tool_call_count = state.get("tool_call_count", 0)
+    logger.info(f"Tool executor node - Executing tools (count: {tool_call_count})")
+
+    tools = get_portfolio_tools()
+    tool_node = ToolNode(tools)
+
+    # Get the last message (which should have tool calls)
+    last_message = state["messages"][-1]
+
+    if not hasattr(last_message, 'tool_calls') or not last_message.tool_calls:
+        logger.warning("No tool calls found in last message")
+        return state
+
+    # Increment tool call counter
+    tool_call_count += 1
+    logger.info(f"Tool call count incremented to: {tool_call_count}")
+
+    # Log the tool calls being executed
+    for tc in last_message.tool_calls:
+        logger.info(f"Executing tool: {tc['name']} with args: {tc.get('args', {})}")
+
+    # Execute tools
+    try:
+        # ToolNode expects the state with messages
+        result = tool_node.invoke(state)
+
+        # Result contains new messages with tool outputs
+        new_messages = list(state["messages"])
+
+        # Add tool result messages
+        if "messages" in result:
+            for msg in result["messages"]:
+                new_messages.append(msg)
+                logger.info(f"Tool result added: {type(msg).__name__}")
+                # Log the first 500 chars of the tool result
+                content_preview = str(msg.content)[:500] if hasattr(msg, 'content') else 'N/A'
+                logger.info(f"Tool result preview: {content_preview}")
+
+        return {
+            "messages": new_messages,
+            "pending_tool_calls": None,
+            "tool_call_count": tool_call_count
+        }
+
+    except Exception as e:
+        logger.exception(f"Tool execution failed: {e}")
+        # Add error as tool message
+        error_msg = ToolMessage(
+            content=f"Error executing tool: {str(e)}",
+            tool_call_id=last_message.tool_calls[0]["id"] if last_message.tool_calls else "error"
+        )
+        return {
+            "messages": list(state["messages"]) + [error_msg],
+            "pending_tool_calls": None,
+            "tool_call_count": tool_call_count
+        }
 
 
-def route_after_validator(state: AgentState) -> Literal["consultant", "optimizer"]:
-    """Decide where to go after validator node."""
-    if state.get("error"):
-        return "consultant"  # Go back to fix errors
-    return "optimizer"
+def should_continue(state: AgentState) -> str:
+    """
+    Determine the next node based on whether there are pending tool calls.
+    """
+    last_message = state["messages"][-1] if state["messages"] else None
+
+    # If the last message is from a tool, go back to agent
+    if isinstance(last_message, ToolMessage):
+        logger.info("Routing: tool_result -> agent")
+        return "agent"
+
+    # If there are tool calls, execute them
+    if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+        logger.info("Routing: has_tool_calls -> tools")
+        return "tools"
+
+    # Otherwise, we're done
+    logger.info("Routing: no_tool_calls -> end")
+    return "end"
 
 
-def create_agent_graph() -> StateGraph:
-    """Create and return the LangGraph agent."""
-    
+# =============================================================================
+# GRAPH CONSTRUCTION
+# =============================================================================
+
+def create_agent_graph():
+    """Create and return the LangGraph agent with tools."""
+
     # Build the graph
     workflow = StateGraph(AgentState)
-    
+
     # Add nodes
-    workflow.add_node("consultant", consultant_node)
-    workflow.add_node("validator", validator_node)
-    workflow.add_node("optimizer", optimizer_node)
-    workflow.add_node("summary", summary_node)
-    
+    workflow.add_node("agent", agent_node)
+    workflow.add_node("tools", tool_executor_node)
+
     # Set entry point
-    workflow.set_entry_point("consultant")
-    
-    # Add edges
+    workflow.set_entry_point("agent")
+
+    # Add conditional edges
     workflow.add_conditional_edges(
-        "consultant",
-        route_after_consultant,
+        "agent",
+        should_continue,
         {
-            "validator": "validator",
+            "tools": "tools",
             "end": END
         }
     )
-    
-    workflow.add_conditional_edges(
-        "validator",
-        route_after_validator,
-        {
-            "consultant": "consultant",
-            "optimizer": "optimizer"
-        }
-    )
-    
-    workflow.add_edge("optimizer", "summary")
-    workflow.add_edge("summary", END)
-    
+
+    # After tools, always go back to agent
+    workflow.add_edge("tools", "agent")
+
     return workflow.compile()
 
 
+# =============================================================================
+# PORTFOLIO AGENT CLASS
+# =============================================================================
+
 class PortfolioAgent:
     """High-level agent interface for the web application."""
-    
+
     def __init__(self):
         self.graph = create_agent_graph()
+        self._init_state()
+        logger.info("PortfolioAgent initialized with tool-based architecture")
+
+    def _init_state(self) -> None:
+        """Initialize or reset the agent state."""
         self.state: AgentState = {
             "messages": [],
-            "investment_amount": None,
-            "preferred_stocks": [],
-            "risk_profile": None,
-            "allocation": None,
-            "error": None,
-            "current_node": "",
-            "needs_info": True
+            "pending_tool_calls": None,
+            "tool_call_count": 0
         }
-    
-    def reset(self):
+
+    def reset(self) -> None:
         """Reset the conversation state."""
-        self.state = {
-            "messages": [],
-            "investment_amount": None,
-            "preferred_stocks": [],
-            "risk_profile": None,
-            "allocation": None,
-            "error": None,
-            "current_node": "",
-            "needs_info": True
-        }
-    
+        logger.info("Resetting agent state")
+        self._init_state()
+
     async def chat(self, user_message: str) -> str:
         """
         Process a user message and return the agent's response.
         """
-        # Add user message to state
+        logger.info(f"Processing user message: {user_message[:100]}...")
+
+        # Add user message to state and reset tool call counter for new message
+        self.state["messages"] = list(self.state["messages"])
         self.state["messages"].append(HumanMessage(content=user_message))
-        
-        # Run the graph
-        result = self.graph.invoke(self.state)
-        
-        # Update state
-        self.state = result
-        
-        # Return the last AI message
+        self.state["tool_call_count"] = 0  # Reset counter for each new user message
+
+        # Run the graph with recursion limit to prevent runaway loops
+        try:
+            result = self.graph.invoke(
+                self.state,
+                config={"recursion_limit": 10}  # Limit to 10 iterations max
+            )
+
+            # Update state
+            self.state = result
+
+            # Trim message history
+            self.state["messages"] = trim_message_history(self.state["messages"])
+
+        except Exception as e:
+            logger.exception(f"Graph invocation failed: {e}")
+            error_response = "I encountered an error processing your request. Please try again."
+            self.state["messages"].append(AIMessage(content=error_response))
+            return error_response
+
+        # Return the last AI message content
         for msg in reversed(result["messages"]):
-            if isinstance(msg, AIMessage):
-                return msg.content
-        
+            if isinstance(msg, AIMessage) and msg.content:
+                # Skip messages that are just tool calls without content
+                if msg.content.strip():
+                    return msg.content
+
         return "I'm processing your request..."
-    
+
     def get_last_response(self) -> str:
         """Get the last AI response."""
         for msg in reversed(self.state["messages"]):
-            if isinstance(msg, AIMessage):
+            if isinstance(msg, AIMessage) and msg.content and msg.content.strip():
                 return msg.content
         return ""
+
+    def get_message_count(self) -> int:
+        """Get the number of messages in the conversation."""
+        return len(self.state["messages"])
