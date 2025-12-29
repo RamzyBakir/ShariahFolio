@@ -114,7 +114,7 @@ ShariahFolio implements a five-layer architecture designed for modularity, scala
 
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=0.48\textwidth]{custom_fig1_full_architecture.png}}
-\caption{ShariahFolio system architecture showing the five-layer design: presentation, API gateway, AI orchestration, ML/optimization, and data layers.}
+\caption{ShariahFolio system architecture}
 \label{fig:architecture}
 \end{figure}
 
@@ -148,7 +148,7 @@ The core intelligence resides in a LangGraph-based multi-agent system with four 
 
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=0.45\textwidth]{custom_fig2_agent_workflow.png}}
-\caption{LangGraph agent workflow showing the four-node state machine with validation loop for error handling.}
+\caption{LangGraph agent workflow}
 \label{fig:agent_flow}
 \end{figure}
 
@@ -209,7 +209,7 @@ A PyTorch-based neural network with the following architecture (Figure \ref{fig:
 
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=0.48\textwidth]{custom_fig3_lstm_architecture.png}}
-\caption{LSTM network architecture for stock return prediction with 30-day input sequences, 32-unit LSTM layer, and fully connected output.}
+\caption{LSTM network architecture for stock return prediction with 30-day input sequences.}
 \label{fig:lstm_arch}
 \end{figure}
 
@@ -244,7 +244,7 @@ Figure \ref{fig:data_pipeline} illustrates the complete data processing pipeline
 
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=0.48\textwidth]{custom_fig5_data_pipeline.png}}
-\caption{Data preprocessing pipeline showing the six-stage process from raw CSV data to train/test split.}
+\caption{Data preprocessing pipeline.}
 \label{fig:data_pipeline}
 \end{figure}
 
@@ -257,7 +257,7 @@ Our dataset comprises 92,515 daily observations of 34 Shariah-compliant stocks f
 
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=0.4\textwidth]{custom_fig7_shariah_funnel.png}}
-\caption{Shariah compliance screening funnel showing reduction from 290 total EGX stocks to 34 Shariah-compliant constituents.}
+\caption{Shariah compliance screening funnel.}
 \label{fig:shariah_funnel}
 \end{figure}
 
@@ -391,7 +391,7 @@ We employ Sequential Least Squares Programming (SLSQP), a gradient-based method 
 
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=0.48\textwidth]{custom_fig4_optimization_process.png}}
-\caption{Portfolio optimization pipeline integrating LSTM predictions, historical covariance, and risk profile constraints.}
+\caption{Portfolio optimization pipeline.}
 \label{fig:opt_process}
 \end{figure}
 
@@ -425,7 +425,7 @@ Figure \ref{fig:feature_importance} shows the relative importance of features in
 
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=0.45\textwidth]{custom_fig10_feature_importance.png}}
-\caption{Feature importance analysis showing previous close price and 30-day volatility as the most predictive features.}
+\caption{Feature importance analysis.}
 \label{fig:feature_importance}
 \end{figure}
 
@@ -453,7 +453,7 @@ We simulate portfolio performance over the 2023 trading year (252 days) using ro
 
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=0.48\textwidth]{custom_fig8_performance_comparison.png}}
-\caption{Portfolio performance comparison showing cumulative returns (top) and rolling Sharpe ratio (bottom) over 2023.}
+\caption{Portfolio performance comparison.}
 \label{fig:performance}
 \end{figure}
 
@@ -486,7 +486,7 @@ Figure \ref{fig:efficient_frontier} visualizes the risk-return tradeoff for 5,00
 
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=0.45\textwidth]{custom_fig9_efficient_frontier.png}}
-\caption{Efficient frontier showing ShariahFolio's optimal portfolio (green star) compared to equal-weight and market index positions.}
+\caption{Efficient frontier of ShariahFolio's optimal portfolio (green star) compared to equal-weight and market index positions.}
 \label{fig:efficient_frontier}
 \end{figure}
 
@@ -520,7 +520,7 @@ Figure \ref{fig:websocket} illustrates the real-time message flow between the us
 
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=0.45\textwidth]{custom_fig6_websocket_flow.png}}
-\caption{WebSocket communication sequence diagram showing real-time interaction between user browser, FastAPI server, and LangGraph agent.}
+\caption{WebSocket communication sequence diagram.}
 \label{fig:websocket}
 \end{figure}
 
