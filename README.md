@@ -4,6 +4,14 @@
   <br>
 </h1>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/Maintained%3F-no-red.svg" alt="Maintenance">
+  <img src="https://img.shields.io/badge/Status-Deprecated-orange" alt="Status">
+</p>
+
+This project was developed for a Deep Learning Class. 
+**Please note:** This project is archived and is not being updated or supported.
+
 <h4 align="center">AI-Powered Shariah-Compliant Portfolio Optimizer for EGX 33</h4>
 
 <p align="center">
