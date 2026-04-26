@@ -426,5 +426,5 @@ ShariahFolio provides **AI-generated investment suggestions** based on historica
 <p align="center">
   Built with ❤️ for Halal investing
   <br>
-  <sub>© 2024 ShariahFolio</sub>
+  <sub>© 2025 ShariahFolio</sub>
 </p>
